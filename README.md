@@ -67,14 +67,6 @@ Started:   2025-01-20T10:30:00Z
 Job stopped: abc123
 ```
 
-### List all jobs
-```bash
-> jobctl list
-ID   STATUS   COMMAND
-abc123   stopped   python3 script.py
-def456   running   /bin/sleep 1000
-```
-
 Connection config via flags:
 ```bash
 > jobctl --server localhost:8443 --cert client.crt --key client.key --ca ca.crt start -- echo meow
@@ -82,21 +74,123 @@ Connection config via flags:
 
 ## API Design
 
-### gRPC Methods
+### Protocol Buffer Specification
 
-- `Start(command[]) => job_id`: Start a new job with the given command and arguments
-- `Stop(job_id)`: Stop a running job
-- `Status(job_id) => JobStatus`: Get current status, PID, exit code, timestamps
-- `StreamOutput(job_id) => stream bytes`: Stream output from job start until completion
-- `List() => []JobStatus`: List all jobs
+```protobuf
+syntax = "proto3";
 
-Output is streamed as raw bytes to support binary data. Possible statuses are: [`RUNNING`, `COMPLETED`, `FAILED`, `STOPPED`]
+package jobworker.v1;
+
+option go_package = "github.com/jobworker/api/v1;jobworkerv1";
+
+service JobWorker {
+  // Start a new job with the given command and arguments
+  rpc Start(StartRequest) returns (StartResponse);
+  
+  // Stop a running job
+  rpc Stop(StopRequest) returns (StopResponse);
+  
+  // Get current status of a job
+  rpc Status(StatusRequest) returns (StatusResponse);
+  
+  // Stream output from job start until completion
+  rpc StreamOutput(StreamOutputRequest) returns (stream StreamOutputResponse);
+}
+
+message StartRequest {
+  // Command and arguments to execute (e.g., ["python3", "script.py"])
+  repeated string command = 1;
+}
+
+message StartResponse {
+  string job_id = 1;
+}
+
+message StopRequest {
+  string job_id = 1;
+}
+
+message StopResponse {}
+
+message StatusRequest {
+  string job_id = 1;
+}
+
+message StatusResponse {
+  string job_id = 1;
+  repeated string command = 2;
+  JobState state = 3;
+  int32 pid = 4;
+  int32 exit_code = 5;
+  string started_at = 6;   // RFC3339 timestamp
+  string completed_at = 7; // RFC3339 timestamp, empty if still running
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_RUNNING = 1;
+  JOB_STATE_COMPLETED = 2; // exit code 0
+  JOB_STATE_FAILED = 3;    // exit code != 0
+  JOB_STATE_STOPPED = 4;   // killed by user
+}
+
+message StreamOutputRequest {
+  string job_id = 1;
+}
+
+message StreamOutputResponse {
+  // Raw bytes of combined stdout/stderr
+  bytes data = 1;
+}
+```
+
+Output is streamed as raw bytes to support binary data.
 
 ## TLS Configuration
 
 ### Certificate Setup
 
-For the PoC, certs will be pre-generated and kept in static local files.
+This project uses mTLS with TLS 1.3 only. Go's TLS 1.3 implementation handles cipher suite negotiation automatically, limiting it to strong options (AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305). The server will be configured to require and verify client certificates.
+
+For the PoC, certificates will be pre-generated
+
+#### Certificate Generation
+
+```bash
+# Generate CA private key (ECDSA P-256)
+openssl ecparam -genkey -name prime256v1 -out ca.key
+
+# Generate self-signed CA certificate (valid 365 days)
+openssl req -new -x509 -days 365 -key ca.key -out ca.crt \
+  -subj "/CN=JobWorker CA"
+
+# Generate server private key
+openssl ecparam -genkey -name prime256v1 -out server.key
+
+# Generate server CSR
+openssl req -new -key server.key -out server.csr \
+  -subj "/CN=localhost"
+
+# Sign server certificate with CA
+openssl x509 -req -days 365 -in server.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out server.crt \
+  -extfile <(echo "subjectAltName=DNS:localhost,IP:127.0.0.1")
+
+# Generate client private key (repeat for each client identity)
+openssl ecparam -genkey -name prime256v1 -out admin.key
+
+# Generate client CSR with CN used for authorization
+openssl req -new -key admin.key -out admin.csr \
+  -subj "/CN=admin"
+
+# Sign client certificate with CA
+openssl x509 -req -days 365 -in admin.csr -CA ca.crt -CAkey ca.key \
+  -CAcreateserial -out admin.crt
+```
+
+**Algorithm choices:**
+- **ECDSA with P-256**: Modern, efficient, and widely supported. Provides equivalent security to RSA-3072 with smaller key sizes.
+- **SHA-256**: Used by OpenSSL for signing (and is the default for ECDSA).
 
 **Tradeoff**: Pre-generated certs simplify setup but should never be used in production. A production system would integrate with a proper PKI.
 
@@ -107,8 +201,8 @@ Auth is based on the client certificate's Common Name (CN). A hardcoded-mapping 
 ```go
 // TODO: In production, load from config file or external system
 var permissions = map[string][]string{
-    "admin":  {"start", "stop", "status", "logs", "list"},
-    "viewer": {"status", "logs", "list"},
+    "admin":  {"start", "stop", "status", "logs"},
+    "viewer": {"status", "logs"},
 }
 ```
 
@@ -132,14 +226,6 @@ To avoid polling, readers block using a condition variable (`sync.Cond`) when th
 
 **Tradeoff**: Storing all output in-memory limits the size of output we can handle. A production system would use a file-backed buffer. For this PoC, this in-memory approach is simpler and sufficient for reasonable output sizes.
 
-## TLS Configuration
-
-This project will use mTLS with TLS 1.3 only. Go's TLS 1.3 implementation handles cipher suite negotiation automatically, limiting it to strong options (e.g. AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305). Server will be configured to require and verify client certificates.
-
-For the PoC, certs will be pre-generated and kept in static local files.
-
-**Tradeoff**: Pre-generated certs simplify setup but should never be used in production. A production system would integrate with a proper PKI.
-
 ## Process Lifecycle
 
 ### Starting a Job
@@ -153,10 +239,8 @@ For the PoC, certs will be pre-generated and kept in static local files.
 
 ### Stopping a Job
 
-1. Send `SIGTERM` to process
-2. Wait briefly for graceful shutdown
-3. Send `SIGKILL` if still running
-4. Mark job as stopped
+1. Send `SIGKILL` to process
+2. Mark job as stopped
 
 ### Job States
 
