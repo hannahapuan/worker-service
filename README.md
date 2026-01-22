@@ -74,75 +74,21 @@ Connection config via flags:
 
 ## API Design
 
-### Protocol Buffer Specification
+The gRPC API is defined in [`api/v1/jobworker.proto`](api/v1/jobworker.proto).
 
-```protobuf
-syntax = "proto3";
+### Methods
 
-package jobworker.v1;
+- **Start(command[])** => job_id: Start a new job
+- **Stop(job_id)** => Stop a running job  
+- **Status(job_id)** => JobStatus: Get job state, PID, exit code, timestamps
+- **StreamOutput(job_id)** => stream bytes: Stream output from job start until completion
 
-option go_package = "github.com/jobworker/api/v1;jobworkerv1";
+### Job States
 
-service JobWorker {
-  // Start a new job with the given command and arguments
-  rpc Start(StartRequest) returns (StartResponse);
-  
-  // Stop a running job
-  rpc Stop(StopRequest) returns (StopResponse);
-  
-  // Get current status of a job
-  rpc Status(StatusRequest) returns (StatusResponse);
-  
-  // Stream output from job start until completion
-  rpc StreamOutput(StreamOutputRequest) returns (stream StreamOutputResponse);
-}
-
-message StartRequest {
-  // Command and arguments to execute (e.g., ["python3", "script.py"])
-  repeated string command = 1;
-}
-
-message StartResponse {
-  string job_id = 1;
-}
-
-message StopRequest {
-  string job_id = 1;
-}
-
-message StopResponse {}
-
-message StatusRequest {
-  string job_id = 1;
-}
-
-message StatusResponse {
-  string job_id = 1;
-  repeated string command = 2;
-  JobState state = 3;
-  int32 pid = 4;
-  int32 exit_code = 5;
-  string started_at = 6;   // RFC3339 timestamp
-  string completed_at = 7; // RFC3339 timestamp, empty if still running
-}
-
-enum JobState {
-  JOB_STATE_UNSPECIFIED = 0;
-  JOB_STATE_RUNNING = 1;
-  JOB_STATE_COMPLETED = 2; // exit code 0
-  JOB_STATE_FAILED = 3;    // exit code != 0 (includes external kills like OOM, manual kill)
-  JOB_STATE_STOPPED = 4;   // killed via Stop() API only
-}
-
-message StreamOutputRequest {
-  string job_id = 1;
-}
-
-message StreamOutputResponse {
-  // Raw bytes of combined stdout/stderr
-  bytes data = 1;
-}
-```
+- `RUNNING`: Job is executing
+- `COMPLETED`: Exited with code 0
+- `FAILED`: Exited with code != 0 (includes OOM kills, external signals)
+- `STOPPED`: Killed via Stop() API
 
 Output is streamed as raw bytes to support binary data.
 
@@ -236,7 +182,7 @@ A reader connecting after job completion reads from the buffer starting at offse
 
 #### Client disconnection
 
-When a client disconnects midstream, gRPC cancels the stream context. The server goroutine exits and its local offset is garbage collected. That way no cleanup is needed and other readers are unaffected.
+When a client disconnects mid-stream, gRPC cancels the stream context. If the reader goroutine is blocked waiting for data, we need to wake it up so it can observe the cancellation. The buffer's `Read` method accepts a context, and a separate goroutine watches for cancellation and calls `Broadcast()` to wake any blocked readers. The read loop then checks `ctx.Err()` and exits cleanly. This prevents goroutine leaks when clients disconnect while waiting for output from a job that is still running.
 
 #### Job completion
 
@@ -277,7 +223,6 @@ When a job exits, the buffer is marked closed and all waiting readers are awoken
 - mTLS handshake success and failure (wrong cert, expired cert)
 - Authorization denial for unpermitted operations
 - Output streaming with multiple concurrent clients
-- Graceful shutdown
 
 Tests requiring network access will use localhost. Tests will be run with `-race` flag to detect data races.
 
