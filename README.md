@@ -130,8 +130,8 @@ enum JobState {
   JOB_STATE_UNSPECIFIED = 0;
   JOB_STATE_RUNNING = 1;
   JOB_STATE_COMPLETED = 2; // exit code 0
-  JOB_STATE_FAILED = 3;    // exit code != 0
-  JOB_STATE_STOPPED = 4;   // killed by user
+  JOB_STATE_FAILED = 3;    // exit code != 0 (includes external kills like OOM, manual kill)
+  JOB_STATE_STOPPED = 4;   // killed via Stop() API only
 }
 
 message StreamOutputRequest {
@@ -152,9 +152,9 @@ Output is streamed as raw bytes to support binary data.
 
 This project uses mTLS with TLS 1.3 only. Go's TLS 1.3 implementation handles cipher suite negotiation automatically, limiting it to strong options (AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305). The server will be configured to require and verify client certificates.
 
-For the PoC, certificates will be pre-generated
-
 #### Certificate Generation
+
+For the PoC, certificates will be pre-generated
 
 ```bash
 # Generate CA private key (ECDSA P-256)
@@ -190,7 +190,7 @@ openssl x509 -req -days 365 -in admin.csr -CA ca.crt -CAkey ca.key \
 
 **Algorithm choices:**
 - **ECDSA with P-256**: Modern, efficient, and widely supported. Provides equivalent security to RSA-3072 with smaller key sizes.
-- **SHA-256**: Used by OpenSSL for signing (and is the default for ECDSA).
+- **SHA-256**: Used implicitly by OpenSSL for signing (default for ECDSA).
 
 **Tradeoff**: Pre-generated certs simplify setup but should never be used in production. A production system would integrate with a proper PKI.
 
@@ -225,6 +225,22 @@ Each job maintains an in-memory buffer that captures combined stdout/stderr from
 To avoid polling, readers block using a condition variable (`sync.Cond`) when they've caught up to the latest output. When new data arrives, all waiting readers are awoken via broadcast. Then we can use the "`tail -f`"-like functionality without busy-waiting.
 
 **Tradeoff**: Storing all output in-memory limits the size of output we can handle. A production system would use a file-backed buffer. For this PoC, this in-memory approach is simpler and sufficient for reasonable output sizes.
+
+### Reader Lifecycle
+
+Each reader maintains its own offset as a local variable in the streaming RPC goroutine. Readers don't register with the buffer. This allows:
+
+#### Late readers
+
+A reader connecting after job completion reads from the buffer starting at offset 0. Since the buffer is marked closed, there's no blocking. It reads all available data and receives the EOF signal.
+
+#### Client disconnection
+
+When a client disconnects midstream, gRPC cancels the stream context. The server goroutine exits and its local offset is garbage collected. That way no cleanup is needed and other readers are unaffected.
+
+#### Job completion
+
+When a job exits, the buffer is marked closed and all waiting readers are awoken via broadcast. They read any remaining data and receive the EOF signal.
 
 ## Process Lifecycle
 
