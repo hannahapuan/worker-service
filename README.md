@@ -184,6 +184,16 @@ A reader connecting after job completion reads from the buffer starting at offse
 
 When a client disconnects mid-stream, gRPC cancels the stream context. If the reader goroutine is blocked waiting for data, we need to wake it up so it can observe the cancellation. The buffer's `Read` method accepts a context, and a separate goroutine watches for cancellation and calls `Broadcast()` to wake any blocked readers. The read loop then checks `ctx.Err()` and exits cleanly. This prevents goroutine leaks when clients disconnect while waiting for output from a job that is still running.
 
+**Tradeoff**: Using `Broadcast()` to wake a cancelled reader will also wake all other waiting readers whose contexts are still valid. They wake up, recheck their conditions (no new data, buffer not closed, context not cancelled), and go back to waiting.
+
+For the PoC, this is was decided as sufficient behavior because:
+
+1. Correctness is maintained as the reader will wake up, check their conditions, and then go back to waiting
+2. Client disconnections are rare compared to new data arriving
+3. The cost of the conditional and then going back to sleep is small (especially compared to I/O operations)
+
+Alternative approaches like per-reader condition variables or tracking reader registries would add nontrivial complexity for little benefit in this PoC scope.
+
 #### Job completion
 
 When a job exits, the buffer is marked closed and all waiting readers are awoken via broadcast. They read any remaining data and receive the EOF signal.
