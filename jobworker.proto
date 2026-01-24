@@ -1,0 +1,64 @@
+syntax = "proto3";
+
+package jobworker.v1;
+
+option go_package = "github.com/jobworker/api/v1;jobworkerv1";
+
+service JobWorker {
+  // Start a new job with the given command and arguments
+  rpc Start(StartRequest) returns (StartResponse);
+  
+  // Stop a running job
+  rpc Stop(StopRequest) returns (StopResponse);
+  
+  // Get current status of a job
+  rpc Status(StatusRequest) returns (StatusResponse);
+  
+  // Stream output from job start until completion
+  rpc StreamOutput(StreamOutputRequest) returns (stream StreamOutputResponse);
+}
+
+message StartRequest {
+  // Command and arguments to execute (e.g., ["python3", "script.py"])
+  repeated string command = 1;
+}
+
+message StartResponse {
+  string job_id = 1;
+}
+
+message StopRequest {
+  string job_id = 1;
+}
+
+message StopResponse {}
+
+message StatusRequest {
+  string job_id = 1;
+}
+
+message StatusResponse {
+  string job_id = 1;
+  repeated string command = 2;
+  JobState state = 3;
+  int32 exit_code = 5;
+  string started_at = 6;   // RFC3339 timestamp
+  string completed_at = 7; // RFC3339 timestamp, empty if still running
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_RUNNING = 1;
+  JOB_STATE_COMPLETED = 2; // exit code 0
+  JOB_STATE_FAILED = 3;    // exit code != 0 (includes external kills like OOM, manual kill)
+  JOB_STATE_STOPPED = 4;   // killed via Stop() API only
+}
+
+message StreamOutputRequest {
+  string job_id = 1;
+}
+
+message StreamOutputResponse {
+  // Raw bytes of combined stdout/stderr
+  bytes data = 1;
+}
